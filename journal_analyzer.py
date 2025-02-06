@@ -1,8 +1,14 @@
-
 from dotenv import load_dotenv
 import os
 
-load_dotenv("journal_analyzer.env")  # Explicitly specify path
+print(f"Loading environment from: journal_analyzer.env")
+load_dotenv("journal_analyzer.env")
+
+# Debug: Print masked versions of credentials
+api_token = os.getenv("NOTION_API_TOKEN")
+db_id = os.getenv("NOTION_DATABASE_ID")
+print(f"API Token loaded: {'secret_' + '*'*10 if api_token and api_token.startswith('secret_') else 'INVALID'}")
+print(f"Database ID loaded: {db_id[:4] + '*'*8 if db_id else 'MISSING'}")
 
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN")
@@ -21,14 +27,16 @@ import pandas as pd
 
 
 def clean_text(text):
-    """Removes excessive whitespace and normalizes text."""
-    text = text.strip()  # Remove leading/trailing whitespace
+    """Mild cleaning: Normalize spaces but keep capitalization & formatting."""
+    if not text:
+        return text  # Ensure we don't mistakenly process NoneType
+
     text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces with a single space
-    return text.lower()  # Convert to lowercase for consistency
+    text = text.lower()  # Convert to lowercase for consistency
+    return text.strip()  # Remove leading/trailing whitespace but keep everything else
 
-
+"""Cleans journal entries and removes empty ones."""
 def clean_entries(entries):
-    """Cleans journal entries and removes empty ones."""
     cleaned_entries = []
     for entry in entries:
         title = clean_text(entry["title"])
@@ -39,8 +47,7 @@ def clean_entries(entries):
                 "title": title,
                 "content": content,
                 "date_created": entry["date_created"],
-                "date_edited": entry["date_edited"],
-                "date_property": entry["date_property"]
+                "date_edited": entry["date_edited"]
             })
     
     return cleaned_entries
@@ -65,7 +72,7 @@ def save_to_sqlite(entries, db_filename="journal_data.db"):
     # Drop existing table if it exists
     cursor.execute("DROP TABLE IF EXISTS journal")
 
-    # Create table
+    # Create table with additional emotion columns
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS journal (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,22 +80,36 @@ def save_to_sqlite(entries, db_filename="journal_data.db"):
             content TEXT,
             date_created TEXT,
             date_edited TEXT,
-            date_property TEXT,
-            sentiment TEXT,
-            sentiment_score FLOAT,
+            primary_emotion TEXT,
+            primary_emotion_score FLOAT,
+            secondary_emotion TEXT,
+            secondary_emotion_score FLOAT,
+            tertiary_emotion TEXT,
+            tertiary_emotion_score FLOAT,
             keywords TEXT
         )
-    """)  # Closing the SQL string properly
-
+    """)
 
     for entry in entries:
-        # Insert data
-        keywords_str = ", ".join(entry["keywords"]) if isinstance(entry["keywords"], list) else entry["keywords"]
-
+        # Assuming entry["sentiment"] now contains the emotion analysis results
+        emotions = entry["sentiment"]["top_emotions"]
         cursor.execute("""
-            INSERT INTO journal (title, content, date_created, date_edited, date_property, sentiment, sentiment_score, keywords)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (entry["title"], entry["content"], entry["date_created"], entry["date_edited"], entry["date_property"], entry["sentiment"], entry["sentiment_score"], keywords_str))
+            INSERT INTO journal (
+                title, content, date_created, date_edited,
+                primary_emotion, primary_emotion_score,
+                secondary_emotion, secondary_emotion_score,
+                tertiary_emotion, tertiary_emotion_score,
+                keywords
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            entry["title"], entry["content"],
+            entry["date_created"], entry["date_edited"],
+            emotions[0]["emotion"], emotions[0]["score"],
+            emotions[1]["emotion"], emotions[1]["score"],
+            emotions[2]["emotion"], emotions[2]["score"],
+            ", ".join(entry["keywords"])
+        ))
 
     conn.commit()
     conn.close()
@@ -105,65 +126,140 @@ def fetch_database_properties(database_id):
     for key, value in response["properties"].items():
         print(f"{key}: {value['type']}")
 
-def fetch_page_content(block_id):
-    response = notion.blocks.children.list(block_id=block_id)
-    content = []
 
-    for block in response['results']:
-        # Check if the block contains rich text
-        if block['type'] in ['paragraph', 'bulleted_list_item', 'heading_1', 'heading_2', 'heading_3']:
-            rich_text = block[block['type']].get('rich_text', [])
-            if rich_text:
-                # Combine plain text from all rich_text segments
-                text = "".join([text['plain_text'] for text in rich_text])
-                if block['type'] == 'bulleted_list_item':
-                    content.append(f"- {text}")  # Format as a list item
-                elif block['type'] == 'heading_1':
-                    content.append(f"# {text}")  # Format as a heading
-                elif block['type'] == 'heading_2':
-                    content.append(f"## {text}")  # Format as a heading
-                elif block['type'] == 'heading_3':
-                    content.append(f"### {text}")  # Format as a heading
+def fetch_page_content(page_id):
+    """Fetches full content of a Notion page by recursively retrieving all blocks including nested ones."""
+    try:
+        # Track skipped block types at the outer scope
+        skipped_types = set()
+
+        # Get page title
+        page = notion.pages.retrieve(page_id)
+        page_title = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else "Untitled"
+
+        def get_block_content(block_id):
+            blocks = notion.blocks.children.list(block_id=block_id)
+            content = []
+            
+            for block in blocks.get("results", []):
+                block_type = block["type"]
+                
+                # Handle text-based block types
+                if block_type in ["paragraph", "heading_1", "heading_2", "heading_3", 
+                                "bulleted_list_item", "numbered_list_item", "quote", 
+                                "callout", "toggle", "to_do"]:
+                    
+                    # Get the rich text content from the block
+                    rich_text = block[block_type].get("rich_text", [])
+                    if rich_text:
+                        text = "".join([t["plain_text"] for t in rich_text])
+                        
+                        # Format based on block type
+                        if block_type.startswith("heading_"):
+                            level = block_type[-1]  # Get heading level (1, 2, or 3)
+                            content.append(f"{'#' * int(level)} {text}")
+                        elif block_type == "bulleted_list_item":
+                            content.append(f"- {text}")
+                        elif block_type == "numbered_list_item":
+                            content.append(f"1. {text}")
+                        elif block_type == "quote":
+                            content.append(f"> {text}")
+                        elif block_type == "callout":
+                            content.append(f"[!] {text}")
+                        elif block_type == "to_do":
+                            checked = block["to_do"].get("checked", False)
+                            content.append(f"[{'x' if checked else ' '}] {text}")
+                        else:  # paragraph and others
+                            content.append(text)
+                        
+                        # Handle nested blocks
+                        if block.get("has_children", False):
+                            nested_content = get_block_content(block["id"])
+                            # Indent nested content
+                            content.extend("  " + line for line in nested_content.split("\n") if line)
+                
+                # Handle table blocks
+                elif block_type == "table":
+                    # Get table rows
+                    table_rows = []
+                    table_block_id = block["id"]
+                    table_children = notion.blocks.children.list(block_id=table_block_id)
+                    
+                    for row_block in table_children.get("results", []):
+                        if row_block["type"] == "table_row":
+                            # Extract cells from the row
+                            row_cells = []
+                            for cell in row_block["table_row"]["cells"]:
+                                cell_text = "".join([t["plain_text"] for t in cell]) if cell else ""
+                                row_cells.append(cell_text)
+                            table_rows.append(row_cells)
+                    
+                    if table_rows:
+                        # Calculate column widths
+                        col_widths = [max(len(str(cell)) for cell in col) for col in zip(*table_rows)]
+                        
+                        # Format table with ASCII borders
+                        # Header row
+                        header_row = table_rows[0]
+                        content.append("+" + "+".join("-" * (width + 2) for width in col_widths) + "+")
+                        content.append("|" + "|".join(f" {cell:<{width}} " for cell, width in zip(header_row, col_widths)) + "|")
+                        content.append("+" + "+".join("=" * (width + 2) for width in col_widths) + "+")
+                        
+                        # Data rows
+                        for row in table_rows[1:]:
+                            content.append("|" + "|".join(f" {str(cell):<{width}} " for cell, width in zip(row, col_widths)) + "|")
+                            content.append("+" + "+".join("-" * (width + 2) for width in col_widths) + "+")
+                        
+                        content.append("")  # Add blank line after table
+                
+                # Track unsupported block types
                 else:
-                    content.append(text)  # Default formatting for paragraphs
-        else:
-            # Keep track of skipped block types
-            skipped_types = set()
+                    if block_type not in skipped_types:
+                        skipped_types.add(block_type)
 
-            for block in response['results']:
-                if block['type'] not in ['paragraph', 'bulleted_list_item', 'heading_1', 'heading_2', 'heading_3']:
-                    if block['type'] not in skipped_types:
-                        '''print(f"Skipping block type: {block['type']}")'''
-                        skipped_types.add(block['type'])
+            return "\n".join(content)
 
+        full_content = get_block_content(page_id)
+        if skipped_types:
+            print(f"📝 Skipped block types in '{page_title}': {sorted(skipped_types)}")
+        return full_content
 
-    return "\n".join(content) if content else "No content available"
-
-
+    except Exception as e:
+        print(f"🚨 ERROR fetching page content for '{page_title}': {e}")
+        return ""
 
 
 def fetch_journal_entries(database_id):
-    response = notion.databases.query(database_id=database_id)
-    results = response["results"]
+    """Fetch all journal entries from the Notion database, handling pagination."""
+    entries = []
+    has_more = True
+    next_cursor = None
 
-    journal_entries = []
-    for entry in results:
-        properties = entry["properties"]
-        block_id = entry["id"]  # Use the entry ID as block_id for fetching content
+    while has_more:
+        params = {"page_size": 100}  # Limit per request
+        if next_cursor:
+            params["start_cursor"] = next_cursor  # Use next_cursor if available
 
-        # Fetch the page content
-        content = fetch_page_content(block_id) # or "No content available"
+        response = notion.databases.query(database_id=database_id, **params)
 
-        # Append the entry
-        journal_entries.append({
-            "title": properties["Name"]["title"][0]["plain_text"] if properties["Name"]["title"] else "Untitled",
-            "content": content,
-            "date_created": entry["created_time"],  # Metadata field for date created
-            "date_edited": entry["last_edited_time"],  # Metadata field for date last edited
-            "date_property": properties["Date"]["date"]["start"] if properties["Date"]["date"] else None
-        })
+        # Process results
+        for result in response.get("results", []):
+            properties = result["properties"]
+            block_id = result["id"]  # Use the entry ID as block_id for fetching content
+            # Fetch the page content
+            content = fetch_page_content(result["id"]) or ""
+            entries.append({
+                "title": properties["Name"]["title"][0]["plain_text"] if properties["Name"]["title"] else "Untitled",
+                "content": content,
+                "date_created": properties.get("Created", {}).get("created_time", ""),
+                "date_edited": properties.get("Last Edited", {}).get("last_edited_time", ""),
+            })
 
-    return journal_entries
+        # Check if there are more pages
+        has_more = response.get("has_more", False)
+        next_cursor = response.get("next_cursor", None)
+
+    return entries
 
 
 # We'll use a pretrained model from transformers for sentiment analysis.
@@ -173,7 +269,11 @@ from transformers import pipeline
 # Load the sentiment analysis model
 # PyTorch (default), change to "tf" if you're using TensorFlow
 # Explicitly specify the model and revision
-sentiment_model = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", revision="714eb0f", framework="pt")
+sentiment_model = pipeline(
+    "text-classification",
+    model="SamLowe/roberta-base-go_emotions",
+    top_k=None  # This replaces return_all_scores=True
+)
 # Ensure PyTorch is used
 
 import textwrap
@@ -182,28 +282,57 @@ import textwrap
 def analyze_sentiment(text, chunk_size=512):
     """Splits long text into chunks and returns an average sentiment score."""
     if not text.strip():
-        return {"label": "neutral", "score": 0.0}
+        return {"label": "neutral", "score": 0.0, "top_emotions": [
+            {"emotion": "neutral", "score": 0.0},
+            {"emotion": "neutral", "score": 0.0},
+            {"emotion": "neutral", "score": 0.0}
+        ]}
 
     chunks = textwrap.wrap(text, chunk_size)
-    scores = []
-    labels = []
+    all_emotions = []  # Initialize the list here
 
     for chunk in chunks:
-        result = sentiment_model(chunk)
-        scores.append(result[0]["score"])
-        labels.append(result[0]["label"])
+        results = sentiment_model(chunk)[0]  # Get all emotion scores
+        # Sort emotions by score
+        sorted_emotions = sorted(results, key=lambda x: x['score'], reverse=True)
+        # Take top 3 emotions
+        top_emotions = sorted_emotions[:3]
+        all_emotions.append(top_emotions)
 
-    # Majority vote for sentiment label
-    final_label = max(set(labels), key=labels.count)
-    avg_score = sum(scores) / len(scores)  # Average confidence score
+    # Aggregate emotions across chunks
+    final_emotions = {}
+    for chunk_emotions in all_emotions:
+        for emotion in chunk_emotions:
+            label = emotion['label']
+            score = emotion['score']
+            if label in final_emotions:
+                final_emotions[label] += score
+            else:
+                final_emotions[label] = score
 
-    return {"label": final_label, "score": avg_score}
+    # Average the scores and find dominant emotion
+    for label in final_emotions:
+        final_emotions[label] /= len(chunks)
+    
+    dominant_emotion = max(final_emotions.items(), key=lambda x: x[1])
+
+    # Format the return value to match what save_to_sqlite expects
+    return {
+        "label": dominant_emotion[0],
+        "score": dominant_emotion[1],
+        "top_emotions": [
+            {"emotion": e, "score": s} 
+            for e, s in sorted(final_emotions.items(), key=lambda x: x[1], reverse=True)[:3]
+        ]
+    }
 
 
 
 # We'll use TF-IDF (Term Frequency-Inverse Document Frequency) to extract important words. 
 import nltk
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+import re
 
 nltk.download("stopwords")
 from nltk.corpus import stopwords
@@ -213,15 +342,22 @@ stop_words = list(stopwords.words("english"))  # ✅ Convert set to list
 
 def extract_keywords(text, top_n=5):
     """Extracts top keywords from text using TF-IDF."""
+    #text = clean_text(text)  # Apply cleaning
     if not text.strip():  # Handle empty text cases
-        return []
+        print("⚠️ Warning: Text became empty after cleaning.", repr(text))
+        return ["NO_KEYWORDS_FOUND"]
+    #print(f"🔍 Processing text: {repr(text)[:100]}...")  # Print first 100 chars for debugging
 
     vectorizer = TfidfVectorizer(stop_words="english", max_features=top_n)  # ✅ Use 'english' instead of custom stopwords
-    tfidf_matrix = vectorizer.fit_transform([text])
-
-    feature_names = vectorizer.get_feature_names_out()
-    return list(feature_names)
-
+    try:
+        
+        tfidf_matrix = vectorizer.fit_transform([text])
+        feature_names = vectorizer.get_feature_names_out()
+        keywords = feature_names[:10] if len(feature_names) > 0 else ["NO_KEYWORDS_FOUND"]# Return top 10 words
+        return list(keywords)
+    except ValueError as e:
+        print(f"🚨 ERROR: Could not process text: {repr(text)}")
+        return []
 
 
 import time
@@ -238,6 +374,9 @@ def analyze_journal_entries(entries):
     with tqdm(total=total_entries, desc="Processing Entries", unit="entry") as pbar:
         for i, entry in enumerate(entries):
             sentiment = analyze_sentiment(entry["content"])
+            if not entry["content"].strip():
+                print("⚠️ Skipping empty entry:", entry["title"])
+                continue
             keywords = extract_keywords(entry["content"])
 
             analyzed_entries.append({
@@ -245,9 +384,7 @@ def analyze_journal_entries(entries):
                 "content": entry["content"],
                 "date_created": entry["date_created"],
                 "date_edited": entry["date_edited"],
-                "date_property": entry["date_property"],
-                "sentiment": sentiment["label"],
-                "sentiment_score": sentiment["score"],
+                "sentiment": sentiment,  # Now passing the full sentiment object
                 "keywords": keywords
             })
 
@@ -281,6 +418,7 @@ def save_to_json(entries, filename="analyzed_journal_entries.json"):
 
 # Fetch all journal entries
 entries = fetch_journal_entries(NOTION_DATABASE_ID)
+print(f"Total entries fetched: {len(entries)}")
 
 # Clean the data
 cleaned_entries = clean_entries(entries)
@@ -294,11 +432,3 @@ save_to_json(analyzed_entries)
 save_to_sqlite(analyzed_entries)
 
 print (f"Total entries: {len(entries)}")
-
-'''for entry in entries:
-    print(f"Title: {entry['title']}")
-    print(f"Content: {entry['content'][:100]}...")  # Show a snippet of content
-    print(f"Created: {entry['date_created']}")
-    print(f"Last Edited: {entry['date_edited']}")
-    print(f"Date Property: {entry['date_property']}")
-    print("---")'''
