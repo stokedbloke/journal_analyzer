@@ -2,16 +2,17 @@ from dotenv import load_dotenv
 import os
 
 print(f"Loading environment from: journal_analyzer.env")
-load_dotenv("journal_analyzer.env")
-
-# Debug: Print masked versions of credentials
-api_token = os.getenv("NOTION_API_TOKEN")
-db_id = os.getenv("NOTION_DATABASE_ID")
-print(f"API Token loaded: {'secret_' + '*'*10 if api_token and api_token.startswith('secret_') else 'INVALID'}")
-print(f"Database ID loaded: {db_id[:4] + '*'*8 if db_id else 'MISSING'}")
+load_dotenv("journal_analyzer.env",override=True)
 
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN")
+if NOTION_DATABASE_ID:
+    NOTION_DATABASE_ID = NOTION_DATABASE_ID.strip("<>")
+if NOTION_API_TOKEN:
+    NOTION_API_TOKEN = NOTION_API_TOKEN.strip("<>")
+
+print(f"here: {repr(NOTION_API_TOKEN)}")
+
 
 if NOTION_API_TOKEN is None or NOTION_DATABASE_ID is None:
     raise ValueError("Missing Notion API token or database ID. Check your .env file.")
@@ -53,64 +54,124 @@ def clean_entries(entries):
     return cleaned_entries
 
 
-def save_to_csv(entries, filename="journal_entries.csv"):
-    df = pd.DataFrame(entries)
+def save_to_csv(entries, filename="analyzed_journal_entries.csv"):
+    """Save entries to CSV with flattened sentiment structure."""
+    flattened_entries = []
+    
+    for entry in entries:
+        # Create a copy of the entry without the sentiment field
+        flat_entry = {
+            "title": entry["title"],
+            "content": entry["content"],
+            "date_created": entry["date_created"],
+            "date_edited": entry["date_edited"],
+            "keywords": ", ".join(entry["keywords"]),
+            # Add flattened sentiment fields
+            "dominant_emotion": entry["sentiment"]["label"],
+            "dominant_score": entry["sentiment"]["score"],
+            "emotion_1": entry["sentiment"]["top_emotions"][0]["emotion"],
+            "emotion_1_score": entry["sentiment"]["top_emotions"][0]["score"],
+            "emotion_2": entry["sentiment"]["top_emotions"][1]["emotion"],
+            "emotion_2_score": entry["sentiment"]["top_emotions"][1]["score"],
+            "emotion_3": entry["sentiment"]["top_emotions"][2]["emotion"],
+            "emotion_3_score": entry["sentiment"]["top_emotions"][2]["score"]
+        }
+        flattened_entries.append(flat_entry)
+    
+    df = pd.DataFrame(flattened_entries)
     df.to_csv(filename, index=False, encoding="utf-8")
     print(f"Data saved to {filename}")
 
-def save_to_json(entries, filename="journal_entries.json"):
+def save_to_json(entries, filename="analyzed_journal_entries.json"):
+    """Save entries to JSON with flattened sentiment structure."""
+    flattened_entries = []
+    
+    for entry in entries:
+        flat_entry = {
+            "title": entry["title"],
+            "content": entry["content"],
+            "date_created": entry["date_created"],
+            "date_edited": entry["date_edited"],
+            "keywords": entry["keywords"],
+            "emotions": {
+                "dominant": {
+                    "name": entry["sentiment"]["label"],
+                    "score": entry["sentiment"]["score"]
+                },
+                "top_3": [
+                    {
+                        "name": e["emotion"],
+                        "score": e["score"]
+                    } for e in entry["sentiment"]["top_emotions"]
+                ]
+            }
+        }
+        flattened_entries.append(flat_entry)
+    
     with open(filename, "w", encoding="utf-8") as f:
-        json.dump(entries, f, ensure_ascii=False, indent=4)
+        json.dump(flattened_entries, f, ensure_ascii=False, indent=2)
     print(f"Data saved to {filename}")
 
 import sqlite3
 
 def save_to_sqlite(entries, db_filename="journal_data.db"):
+    """Save entries to SQLite with emotions in separate table."""
     conn = sqlite3.connect(db_filename)
     cursor = conn.cursor()
-
-    # Drop existing table if it exists
-    cursor.execute("DROP TABLE IF EXISTS journal")
-
-    # Create table with additional emotion columns
+    
+    # Create tables
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS journal (
+        CREATE TABLE IF NOT EXISTS journal_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             content TEXT,
             date_created TEXT,
             date_edited TEXT,
-            primary_emotion TEXT,
-            primary_emotion_score FLOAT,
-            secondary_emotion TEXT,
-            secondary_emotion_score FLOAT,
-            tertiary_emotion TEXT,
-            tertiary_emotion_score FLOAT,
-            keywords TEXT
+            keywords TEXT,
+            dominant_emotion TEXT,
+            dominant_score FLOAT
         )
     """)
-
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS entry_emotions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER,
+            emotion TEXT,
+            score FLOAT,
+            rank INTEGER,
+            FOREIGN KEY (entry_id) REFERENCES journal_entries (id)
+        )
+    """)
+    
+    # Insert data
     for entry in entries:
-        # Assuming entry["sentiment"] now contains the emotion analysis results
-        emotions = entry["sentiment"]["top_emotions"]
+        # Insert main entry
         cursor.execute("""
-            INSERT INTO journal (
+            INSERT INTO journal_entries (
                 title, content, date_created, date_edited,
-                primary_emotion, primary_emotion_score,
-                secondary_emotion, secondary_emotion_score,
-                tertiary_emotion, tertiary_emotion_score,
-                keywords
+                keywords, dominant_emotion, dominant_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            entry["title"], entry["content"],
-            entry["date_created"], entry["date_edited"],
-            emotions[0]["emotion"], emotions[0]["score"],
-            emotions[1]["emotion"], emotions[1]["score"],
-            emotions[2]["emotion"], emotions[2]["score"],
-            ", ".join(entry["keywords"])
+            entry["title"],
+            entry["content"],
+            entry["date_created"],
+            entry["date_edited"],
+            ", ".join(entry["keywords"]),
+            entry["sentiment"]["label"],
+            entry["sentiment"]["score"]
         ))
-
+        
+        entry_id = cursor.lastrowid
+        
+        # Insert emotions
+        for rank, emotion in enumerate(entry["sentiment"]["top_emotions"], 1):
+            cursor.execute("""
+                INSERT INTO entry_emotions (entry_id, emotion, score, rank)
+                VALUES (?, ?, ?, ?)
+            """, (entry_id, emotion["emotion"], emotion["score"], rank))
+    
     conn.commit()
     conn.close()
     print(f"Data saved to {db_filename}")
@@ -220,8 +281,8 @@ def fetch_page_content(page_id):
             return "\n".join(content)
 
         full_content = get_block_content(page_id)
-        if skipped_types:
-            print(f"📝 Skipped block types in '{page_title}': {sorted(skipped_types)}")
+        #if skipped_types:
+            #print(f"📝 Skipped block types in '{page_title}': {sorted(skipped_types)}")
         return full_content
 
     except Exception as e:
@@ -240,7 +301,11 @@ def fetch_journal_entries(database_id):
         if next_cursor:
             params["start_cursor"] = next_cursor  # Use next_cursor if available
 
-        response = notion.databases.query(database_id=database_id, **params)
+        try:
+            response = notion.databases.query(database_id=database_id, **params)
+            #print("✅ Notion API Response:", response)
+        except Exception as e:
+            print(f"❌ ERROR: Notion API request failed: {e}")
 
         # Process results
         for result in response.get("results", []):
@@ -403,17 +468,6 @@ def analyze_journal_entries(entries):
     
     print(f"\nAnalysis completed in {time.time() - start_time:.2f} seconds")
     return analyzed_entries
-
-
-def save_to_csv(entries, filename="analyzed_journal_entries.csv"):
-    df = pd.DataFrame(entries)
-    df.to_csv(filename, index=False, encoding="utf-8")
-    print(f"Data saved to {filename}")
-
-def save_to_json(entries, filename="analyzed_journal_entries.json"):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(entries, f, ensure_ascii=False, indent=4)
-    print(f"Data saved to {filename}")
 
 
 # Fetch all journal entries

@@ -49,3 +49,5 @@ logs/
 
 # Model files
 models/
+
+.DS_Store
