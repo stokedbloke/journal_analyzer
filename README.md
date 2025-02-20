@@ -1,6 +1,7 @@
 # Journal Analyzer
 
 A Python tool that integrates with Notion to analyze journal entries using sentiment analysis and natural language processing.
+https://www.linkedin.com/pulse/coding-english-chatgpt-expectations-ironies-lessons-neil-sethi-0dlic/?trackingId=QfyKzskxhEnTXGQeVpw8pA%3D%3D
 
 ## Features
 - Fetches journal entries from a Notion database
@@ -70,3 +71,9 @@ python journal_analyzer.py
 - `scikit-learn`: Keyword extraction
 - `python-dotenv`: Environment variable management
 - `tqdm`: Progress bars
+
+## Run the backend
+uvicorn server:app --reload
+
+## Run the frontend
+npm run dev

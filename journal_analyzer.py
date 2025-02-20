@@ -11,12 +11,8 @@ if NOTION_DATABASE_ID:
 if NOTION_API_TOKEN:
     NOTION_API_TOKEN = NOTION_API_TOKEN.strip("<>")
 
-print(f"here: {repr(NOTION_API_TOKEN)}")
-
-
 if NOTION_API_TOKEN is None or NOTION_DATABASE_ID is None:
     raise ValueError("Missing Notion API token or database ID. Check your .env file.")
-
 
 from notion_client import Client
 notion = Client(auth=NOTION_API_TOKEN)
@@ -25,7 +21,6 @@ notion = Client(auth=NOTION_API_TOKEN)
 import re
 import json
 import pandas as pd
-
 
 def clean_text(text):
     """Mild cleaning: Normalize spaces but keep capitalization & formatting."""
@@ -289,6 +284,8 @@ def fetch_page_content(page_id):
         print(f"🚨 ERROR fetching page content for '{page_title}': {e}")
         return ""
 
+import time
+from tqdm import tqdm
 
 def fetch_journal_entries(database_id):
     """Fetch all journal entries from the Notion database, handling pagination."""
@@ -296,34 +293,52 @@ def fetch_journal_entries(database_id):
     has_more = True
     next_cursor = None
 
-    while has_more:
-        params = {"page_size": 100}  # Limit per request
-        if next_cursor:
-            params["start_cursor"] = next_cursor  # Use next_cursor if available
+    start_time = time.time()  # Start the timer
 
-        try:
-            response = notion.databases.query(database_id=database_id, **params)
-            #print("✅ Notion API Response:", response)
-        except Exception as e:
-            print(f"❌ ERROR: Notion API request failed: {e}")
+    with tqdm(desc="Fetching Entries", unit="entry") as pbar:
 
-        # Process results
-        for result in response.get("results", []):
-            properties = result["properties"]
-            block_id = result["id"]  # Use the entry ID as block_id for fetching content
-            # Fetch the page content
-            content = fetch_page_content(result["id"]) or ""
-            entries.append({
-                "title": properties["Name"]["title"][0]["plain_text"] if properties["Name"]["title"] else "Untitled",
-                "content": content,
-                "date_created": properties.get("Created", {}).get("created_time", ""),
-                "date_edited": properties.get("Last Edited", {}).get("last_edited_time", ""),
+        while has_more:
+            params = {"page_size": 100}  # Limit per request
+            if next_cursor:
+                params["start_cursor"] = next_cursor  # Use next_cursor if available
+
+            try:
+                response = notion.databases.query(database_id=database_id, **params)
+                #print("✅ Notion API Response:", response)
+            except Exception as e:
+                print(f"❌ ERROR: Notion API request failed: {e}")
+
+            # Process results
+            for result in response.get("results", []):
+                properties = result["properties"]
+                block_id = result["id"]  # Use the entry ID as block_id for fetching content
+                # Fetch the page content
+                content = fetch_page_content(result["id"]) or ""
+                entries.append({
+                    "title": properties["Name"]["title"][0]["plain_text"] if properties["Name"]["title"] else "Untitled",
+                    "content": content,
+                    "date_created": properties.get("Created", {}).get("created_time", ""),
+                    "date_edited": properties.get("Last Edited", {}).get("last_edited_time", ""),
+                })
+
+                pbar.update(1)  # Update progress bar after each entry
+
+            # Check if there are more pages
+            has_more = response.get("has_more", False)
+            next_cursor = response.get("next_cursor", None)
+
+            # Estimate remaining time
+            elapsed_time = time.time() - start_time
+            avg_time_per_entry = elapsed_time / (len(entries) or 1)
+            estimated_total_time = avg_time_per_entry * (len(entries) + 1)
+            remaining_time = max(0, estimated_total_time - elapsed_time)
+
+            pbar.set_postfix({
+                "Elapsed": f"{elapsed_time:.1f}s",
+                "ETA": f"{remaining_time:.1f}s"
             })
-
-        # Check if there are more pages
-        has_more = response.get("has_more", False)
-        next_cursor = response.get("next_cursor", None)
-
+    
+    print(f"\nFetch completed in {time.time() - start_time:.2f} seconds\n")
     return entries
 
 
@@ -424,9 +439,6 @@ def extract_keywords(text, top_n=5):
         print(f"🚨 ERROR: Could not process text: {repr(text)}")
         return []
 
-
-import time
-from tqdm import tqdm
 
 # Modify your journal processing function to include sentiment and keyword analysis:
 def analyze_journal_entries(entries):
