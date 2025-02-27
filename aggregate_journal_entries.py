@@ -1,36 +1,72 @@
 import pandas as pd
 import sqlite3
+import json
+import numpy as np
 
-# Load CSV
-csv_path = "analyzed_journal_entries.csv"
-df = pd.read_csv(csv_path)
+def custom_daily_aggregator(df_group):
+    """
+    Receives a sub-DataFrame for a single date_created group.
+    Returns a single-row Series with aggregated values across all columns.
+    """
+    result = {}
+    # All rows in this group have the same date_created, so take the first one
+    date_val = df_group["date_created"].iloc[0]
+    result["date_created"] = date_val
 
-# Ensure date is in proper format (truncate to YYYY-MM-DD)
-df['date_created'] = pd.to_datetime(df['date_created']).dt.date
+    for col in df_group.columns:
+        if col == "date_created":
+            continue
 
-# Aggregate by date
-aggregated_df = df.groupby('date_created').agg({
-    'title': lambda x: ' | '.join(x.dropna()),
-    'content': lambda x: ' '.join(x.dropna()),
-    'keywords': lambda x: ', '.join(x.dropna()),
-    'dominant_emotion': lambda x: x.mode()[0] if not x.isna().all() else None,
-    'dominant_score': 'mean',
-    'emotion_1': lambda x: x.mode()[0] if not x.isna().all() else None,
-    'emotion_1_score': 'mean',
-    'emotion_2': lambda x: x.mode()[0] if not x.isna().all() else None,
-    'emotion_2_score': 'mean',
-    'emotion_3': lambda x: x.mode()[0] if not x.isna().all() else None,
-    'emotion_3_score': 'mean'
-}).reset_index()
+        # If the column is numeric (e.g., emotion columns), take the mean.
+        if pd.api.types.is_numeric_dtype(df_group[col]):
+            result[col] = df_group[col].mean(skipna=True)
+        else:
+            if col == "journal_id":
+                joined_ids = ", ".join(df_group["journal_id"].dropna().unique())
+                result["journal_id"] = joined_ids
+            elif col == "keywords":
+                all_keywords = []
+                for val in df_group["keywords"].dropna():
+                    if isinstance(val, list):
+                        all_keywords.extend(val)
+                    else:
+                        all_keywords.append(str(val))
+                all_keywords = list(set(all_keywords))
+                result["keywords"] = " | ".join(all_keywords)
+            else:
+                unique_vals = df_group[col].dropna().astype(str).unique()
+                result[col] = " | ".join(unique_vals)
+    return pd.Series(result)
 
-# Save to a new CSV file
-aggregated_csv_path = "aggregated_journal_entries.csv"
-aggregated_df.to_csv(aggregated_csv_path, index=False)
-print(f"✅ Aggregated journal data saved to: {aggregated_csv_path}")
+# ------------------- MAIN EXECUTION -------------------
 
-# Save to SQLite
+# Load your DataFrame from "analyzed_journal_entries.csv"
+df_csv = pd.read_csv("analyzed_journal_entries.csv")
+
+# Convert date_created to datetime and truncate to YYYY-MM-DD
+df_csv["date_created"] = pd.to_datetime(df_csv["date_created"]).dt.date
+
+# Group by date_created and apply the custom aggregator.
+# Passing group_keys=False to avoid including grouping columns.
+aggregated_df = df_csv.groupby("date_created", as_index=False, group_keys=False).apply(custom_daily_aggregator)
+
+# ------------------- SAVE TO CSV -------------------
+csv_path = "aggregated_journal_entries.csv"
+aggregated_df.to_csv(csv_path, index=False)
+print(f"✅ Aggregated journal data saved to CSV: {csv_path}")
+
+# ------------------- SAVE TO JSON -------------------
+# Convert DataFrame to a list of dictionaries.
+records = aggregated_df.to_dict(orient="records")
+json_path = "aggregated_journal_entries.json"
+with open(json_path, "w", encoding="utf-8") as f:
+    # default=str converts non-serializable objects (like date) to string.
+    json.dump(records, f, ensure_ascii=False, indent=2, default=str)
+print(f"✅ Aggregated journal data saved to JSON: {json_path}")
+
+# ------------------- SAVE TO SQLITE -------------------
 db_path = "journal_data.db"
 conn = sqlite3.connect(db_path)
 aggregated_df.to_sql("AggregatedJournalEntries", conn, if_exists="replace", index=False)
 conn.close()
-print(f"✅ Aggregated data saved to SQLite: {db_path}")
+print(f"✅ Aggregated journal data saved to SQLite: {db_path}")
